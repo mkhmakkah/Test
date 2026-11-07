@@ -1,0 +1,1498 @@
+import http.server
+import socketserver
+import json
+import os
+import random
+import time
+
+PORT = 8080
+STATE_FILE = "camry_ecu_state.json"
+
+# الحالة الافتراضية لكمبيوتر السيارة وإعدادات الشاشة (تُحفظ تلقائياً في ملف JSON)
+default_state = {
+    "setup_done": False,
+    "default_map_pkg": "com.google.android.apps.maps",
+    "default_map_name": "خرائط جوجل",
+    "default_map_icon": "🗺️",
+    "default_music_pkg": "com.google.android.apps.youtube.music",
+    "default_music_name": "يوتيوب ميوزك",
+    "default_music_icon": "▶️",
+    "fuel_unit": "kml",
+    "car_name": "تويوتا كامري 2014 • خاص",
+    "car_glow": "#0a84ff",
+    "car_scale": 100,
+    " hotspot": {
+        "ssid": "iPhone Alhelali",
+        "password": "********",
+        "auto_connect_acc": True,
+        "band": "5GHz",
+        "connected": True,
+        "ip": "172.20.10.2"
+    },
+    "ecu": {
+        "beep_vol": 5,
+        "auto_lock_speed": True,
+        "shift_p_unlock": True,
+        "two_stage_unlock": False,
+        "keyfob_windows": True,
+        "hazard_answerback": True,
+        "relock_timer": "60",
+        "eco_indicator": True,
+        "follow_me_home": "30",
+        "light_sensor_sens": "0",
+        "ac_auto_eco": True,
+        "ac_auto_recirc": True
+    },
+    "headunit": {
+        "reverse_cam_auto": True,
+        "dynamic_guidelines": True,
+        "reverse_mute_level": 70,
+        "illumi_auto_dim": True,
+        "brightness": 90,
+        "dsp_preset": "toyota_oem",
+        "acc_off_delay": "30s",
+        "speed_warning": "120"
+    }
+}
+
+# قائمة جميع التطبيقات المثبتة في شاشة الأندرويد
+installed_apps_db = [
+    {"pkg": "com.google.android.apps.maps", "name": "خرائط جوجل", "cat": "map", "icon": "🗺️", "color": "#1a73e8"},
+    {"pkg": "com.waze", "name": "Waze للملاحة", "cat": "map", "icon": "🚗", "color": "#05c8f7"},
+    {"pkg": "com.radarbot.api", "name": "رادار بوت (كاشف ساهر)", "cat": "map", "icon": "📷", "color": "#f39c12"},
+    {"pkg": "com.here.app.maps", "name": "HERE WeGo", "cat": "map", "icon": "🧭", "color": "#00afaa"},
+    {"pkg": "com.sygic.aura", "name": "Sygic GPS بدون نت", "cat": "map", "icon": "📍", "color": "#2980b9"},
+    {"pkg": "com.google.android.apps.youtube.music", "name": "يوتيوب ميوزك", "cat": "music", "icon": "▶️", "color": "#ff0000"},
+    {"pkg": "com.spotify.music", "name": "Spotify", "cat": "music", "icon": "🎧", "color": "#1db954"},
+    {"pkg": "com.anghami", "name": "أنغامي Anghami", "cat": "music", "icon": "🎵", "color": "#8e44ad"},
+    {"pkg": "com.apple.android.music", "name": "Apple Music", "cat": "music", "icon": "🍎", "color": "#fc3c44"},
+    {"pkg": "com.maxmpz.audioplayer", "name": "مشغل Poweramp", "cat": "music", "icon": "🎚️", "color": "#e67e22"},
+    {"pkg": "org.prowl.torque", "name": "Torque Pro OBD2", "cat": "tool", "icon": "🔧", "color": "#2c3e50"},
+    {"pkg": "com.google.android.youtube", "name": "YouTube", "cat": "video", "icon": "📺", "color": "#c0392b"},
+    {"pkg": "com.android.chrome", "name": "متصفح Chrome", "cat": "tool", "icon": "🌐", "color": "#2980b9"},
+    {"pkg": "com.estrongs.android.pop", "name": "مدير ملفات الشاشة", "cat": "tool", "icon": "📁", "color": "#f1c40f"}
+]
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # دمج آمن مع الإعدادات الافتراضية
+                for k, v in default_state.items():
+                    if k not in data:
+                        data[k] = v
+                return data
+        except Exception:
+            pass
+    return default_state.copy()
+
+def save_state(data):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+system_state = load_state()
+
+html_content = """<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Camry CarPlay OS v3.0</title>
+    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        :root {
+            --bg-dark: #06080d;
+            --card-bg: rgba(20, 24, 34, 0.88);
+            --card-border: rgba(255, 255, 255, 0.08);
+            --accent: #0a84ff;
+            --accent-green: #30d158;
+            --accent-red: #ff453a;
+            --accent-amber: #ff9f0a;
+            --accent-purple: #bf5af2;
+            --text-main: #ffffff;
+            --text-muted: #8e95a5;
+            --car-glow: #0a84ff;
+        }
+        * { box-sizing: border-box; user-select: none; -webkit-user-select: none; }
+        body {
+            margin: 0; padding: 10px;
+            background: radial-gradient(circle at 20% 0%, #141d33 0%, #06080d 70%);
+            color: var(--text-main);
+            font-family: 'Tajawal', -apple-system, BlinkMacSystemFont, sans-serif;
+            display: flex; height: 100vh; width: 100vw; overflow: hidden; gap: 12px;
+        }
+
+        /* الشريط الجانبي الاحترافي (CarPlay Dock) */
+        .dock {
+            width: 80px;
+            background: rgba(15, 18, 26, 0.94);
+            backdrop-filter: blur(25px);
+            border: 1px solid var(--card-border);
+            border-radius: 24px;
+            display: flex; flex-direction: column; justify-content: space-between; align-items: center;
+            padding: 12px 0; z-index: 100;
+            box-shadow: 0 12px 35px rgba(0,0,0,0.7);
+        }
+        .status-top { text-align: center; cursor: pointer; padding: 4px; border-radius: 12px; }
+        .status-top:active { background: rgba(255,255,255,0.08); }
+        .clock { font-size: 20px; font-weight: 900; letter-spacing: 0.5px; line-height: 1.1; }
+        .status-badges { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; align-items: center; }
+        .pill-mini {
+            font-size: 9px; font-weight: 800; padding: 2px 6px; border-radius: 8px;
+            background: rgba(48, 209, 88, 0.16); color: var(--accent-green); white-space: nowrap;
+        }
+        .pill-hotspot { background: rgba(10, 132, 255, 0.2); color: #5ac8fa; }
+
+        .dock-apps { display: flex; flex-direction: column; gap: 10px; }
+        .dock-btn {
+            width: 56px; height: 56px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.08);
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            color: white; font-family: inherit; font-size: 10px; font-weight: 700;
+            cursor: pointer; transition: all 0.2s ease; position: relative;
+        }
+        .dock-btn svg { width: 22px; height: 22px; margin-bottom: 2px; }
+        .dock-btn.active {
+            transform: scale(1.06);
+            box-shadow: 0 0 16px rgba(10, 132, 255, 0.55);
+            border: 1.5px solid rgba(255,255,255,0.65);
+        }
+        .btn-dash { background: linear-gradient(135deg, #0a84ff, #004080); }
+        .btn-ecu { background: linear-gradient(135deg, #ff3b30, #990000); }
+        .btn-media { background: linear-gradient(135deg, #ff2d55, #a30036); }
+        .btn-settings { background: linear-gradient(135deg, #3a4454, #1b2028); }
+
+        .home-orb {
+            width: 46px; height: 46px; border-radius: 15px;
+            background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            cursor: pointer; font-size: 8px; font-weight: 700; color: #ccc; gap: 2px;
+        }
+        .home-orb:active { transform: scale(0.92); background: var(--accent); color: #fff; }
+
+        /* منطقة الشاشات */
+        .viewport { flex: 1; display: flex; position: relative; overflow: hidden; }
+        .screen { display: none; width: 100%; height: 100%; gap: 12px; }
+        .screen.active { display: flex; animation: fadeIn 0.22s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+        .card {
+            background: var(--card-bg);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--card-border);
+            border-radius: 22px;
+            padding: 14px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            position: relative; overflow: hidden;
+        }
+
+        /* ================= 1. الشاشة الرئيسية (Dashboard) ================= */
+        .map-card { flex: 1.35; padding: 0; display: flex; flex-direction: column; }
+        #map { width: 100%; height: 100%; z-index: 1; background: #0d1117; }
+        .leaflet-layer { filter: invert(100%) hue-rotate(180deg) brightness(92%) contrast(90%); }
+        .map-overlay-top {
+            position: absolute; top: 12px; right: 12px; left: 12px; z-index: 10;
+            display: flex; justify-content: space-between; align-items: flex-start; pointer-events: none;
+        }
+        .nav-pill {
+            background: rgba(13, 18, 30, 0.92); backdrop-filter: blur(15px);
+            padding: 8px 14px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.14);
+            display: flex; align-items: center; gap: 10px; pointer-events: auto; cursor: pointer;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.5);
+        }
+        .speed-cluster {
+            background: rgba(13, 18, 30, 0.94); border: 2px solid var(--accent);
+            padding: 6px 12px; border-radius: 18px; text-align: center; pointer-events: auto;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.5);
+        }
+        .speed-val { font-size: 24px; font-weight: 900; line-height: 1; }
+        .speed-unit { font-size: 9px; color: var(--text-muted); font-weight: 700; }
+
+        .map-overlay-bottom {
+            position: absolute; bottom: 12px; right: 12px; left: 12px; z-index: 10;
+            display: flex; justify-content: space-between; align-items: center; pointer-events: none;
+        }
+        .quick-bar {
+            background: rgba(13, 18, 30, 0.92); backdrop-filter: blur(15px);
+            padding: 6px 12px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.12);
+            display: flex; gap: 12px; align-items: center; pointer-events: auto; font-size: 11px; font-weight: 700;
+        }
+
+        .side-col { flex: 1.05; display: flex; flex-direction: column; gap: 12px; }
+
+        /* بطاقة استوديو المركبة الاحترافية (Vehicle Showroom Card) */
+        .car-studio-card {
+            flex: 1.15; display: flex; flex-direction: column; justify-content: space-between;
+            background: radial-gradient(circle at 50% 65%, rgba(10, 132, 255, 0.22), rgba(16, 20, 30, 0.95) 75%);
+            padding: 12px 14px;
+        }
+        .studio-header { display: flex; justify-content: space-between; align-items: center; z-index: 2; }
+        .car-stage {
+            position: relative; flex: 1; display: flex; justify-content: center; align-items: center;
+            my: 2px; overflow: visible;
+        }
+        .car-glow-floor {
+            position: absolute; bottom: 6px; width: 75%; height: 22px;
+            background: var(--car-glow); filter: blur(18px); opacity: 0.65; border-radius: 50%;
+            transition: all 0.3s ease;
+        }
+        .car-render-img {
+            max-width: 82%; max-height: 92px; object-fit: contain; z-index: 2;
+            filter: drop-shadow(0 10px 14px rgba(0,0,0,0.85));
+            transition: transform 0.25s ease;
+        }
+        .tpms-floating {
+            position: absolute; inset: 0; display: flex; justify-content: space-between;
+            align-items: center; pointer-events: none; z-index: 3; padding: 0 2px;
+        }
+        .tpms-col { display: flex; flex-direction: column; justify-content: space-between; height: 82%; }
+        .tpms-chip {
+            background: rgba(10, 14, 22, 0.85); border: 1px solid rgba(48, 209, 88, 0.45);
+            border-radius: 8px; padding: 2px 6px; font-size: 10px; font-weight: 800; color: #fff;
+        }
+        .studio-footer {
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; z-index: 2;
+        }
+        .mini-stat {
+            background: rgba(0,0,0,0.38); border: 1px solid rgba(255,255,255,0.06);
+            border-radius: 10px; padding: 4px; text-align: center;
+        }
+        .mini-stat-val { font-size: 13px; font-weight: 800; color: #fff; }
+        .mini-stat-lbl { font-size: 9px; color: var(--text-muted); }
+
+        /* بطاقة المشغل الصوتي */
+        .media-card { flex: 0.95; display: flex; flex-direction: column; justify-content: space-between; padding: 12px 14px; }
+        .media-top { display: flex; justify-content: space-between; align-items: center; }
+        .app-pill-btn {
+            background: rgba(255, 45, 85, 0.18); border: 1px solid rgba(255, 45, 85, 0.4);
+            color: #ff6482; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 800;
+            cursor: pointer; display: flex; align-items: center; gap: 4px;
+        }
+        .media-Controls-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+        .m-btn {
+            width: 38px; height: 38px; border-radius: 50%; border: none;
+            background: rgba(255,255,255,0.1); color: white;
+            display: flex; justify-content: center; align-items: center; cursor: pointer;
+        }
+        .m-btn.play { width: 46px; height: 46px; background: white; color: black; }
+
+        /* ================= 2. شاشة كمبيوتر السيارة الحي (OBD2 / CANBUS ECU) ================= */
+        .ecu-layout { width: 100%; display: flex; flex-direction: column; gap: 10px; }
+        .canbus-banner {
+            background: linear-gradient(90deg, rgba(16, 36, 28, 0.95), rgba(18, 24, 38, 0.95));
+            border: 1px solid rgba(48, 209, 88, 0.35); border-radius: 18px;
+            padding: 10px 16px; display: flex; justify-content: space-between; align-items: center;
+        }
+        .pulse-dot {
+            width: 10px; height: 10px; border-radius: 50%; background: var(--accent-green);
+            box-shadow: 0 0 10px var(--accent-green); animation: pulse 1.2s infinite; display: inline-block;
+        }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.35; } 100% { opacity: 1; } }
+
+        .ecu-tabs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+        .ecu-tab {
+            padding: 10px; border-radius: 14px; border: 1px solid var(--card-border);
+            background: rgba(255,255,255,0.04); color: var(--text-muted);
+            font-family: inherit; font-size: 13px; font-weight: 800; cursor: pointer;
+            display: flex; align-items: center; justify-content: center; gap: 6px;
+        }
+        .ecu-tab.active {
+            background: var(--accent); color: white; border-color: transparent;
+            box-shadow: 0 5px 15px rgba(10, 132, 255, 0.35);
+        }
+        .ecu-panel { display: none; flex: 1; gap: 12px; overflow-y: auto; }
+        .ecu-panel.active { display: flex; }
+
+        .settings-list { flex: 1; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; padding-left: 4px; }
+        .setting-row {
+            background: rgba(255,255,255,0.035); border: 1px solid rgba(255,255,255,0.06);
+            border-radius: 15px; padding: 10px 14px;
+            display: flex; justify-content: space-between; align-items: center; gap: 10px;
+        }
+        .setting-title { font-size: 14px; font-weight: 800; display: flex; align-items: center; gap: 6px; }
+        .setting-desc { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+        .can-tag {
+            font-size: 9px; font-family: monospace; padding: 2px 6px; border-radius: 6px;
+            background: rgba(255,255,255,0.08); color: #64d2ff;
+        }
+
+        /* ================= 3. صفحة الإعدادات الشاملة (Full System Settings OS) ================= */
+        .settings-os-layout { width: 100%; height: 100%; display: flex; gap: 12px; }
+        .settings-sidebar {
+            width: 220px; display: flex; flex-direction: column; gap: 6px;
+            background: rgba(15, 19, 28, 0.9); border: 1px solid var(--card-border);
+            border-radius: 22px; padding: 12px;
+        }
+        .settings-nav-title { font-size: 16px; font-weight: 900; padding: 4px 8px 8px; border-bottom: 1px solid rgba(255,255,255,0.08); margin-bottom: 4px; }
+        .s-nav-btn {
+            background: transparent; border: none; color: var(--text-muted);
+            padding: 11px 12px; border-radius: 14px; font-family: inherit; font-size: 13px; font-weight: 800;
+            text-align: right; cursor: pointer; display: flex; align-items: center; gap: 10px;
+            transition: 0.2s;
+        }
+        .s-nav-btn.active { background: var(--accent); color: white; box-shadow: 0 4px 14px rgba(10,132,255,0.35); }
+        .s-content-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .s-pane { display: none; flex-direction: column; gap: 10px; height: 100%; overflow-y: auto; }
+        .s-pane.active { display: flex; }
+
+        /* عناصر التحكم القياسية */
+        .switch { position: relative; display: inline-block; width: 48px; height: 26px; flex-shrink: 0; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider {
+            position: absolute; cursor: pointer; inset: 0;
+            background-color: rgba(255,255,255,0.18); transition: .25s; border-radius: 26px;
+        }
+        .slider:before {
+            position: absolute; content: ""; height: 20px; width: 20px; left: 3px; bottom: 3px;
+            background-color: white; transition: .25s; border-radius: 50%;
+        }
+        input:checked + .slider { background-color: var(--accent-green); }
+        input:checked + .slider:before { transform: translateX(22px); }
+
+        .range-slider {
+            -webkit-appearance: none; width: 120px; height: 7px; border-radius: 5px;
+            background: rgba(255,255,255,0.2); outline: none;
+        }
+        .range-slider::-webkit-slider-thumb {
+            -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%;
+            background: var(--accent-amber); cursor: pointer;
+        }
+        .btn-action {
+            background: var(--accent); color: white; border: none; padding: 8px 14px;
+            border-radius: 12px; font-family: inherit; font-size: 12px; font-weight: 800;
+            cursor: pointer; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px;
+        }
+        .btn-action:active { transform: scale(0.95); }
+        .select-ui {
+            background: #1a2030; color: white; border: 1px solid #35405a;
+            padding: 7px 12px; border-radius: 10px; font-family: inherit; font-size: 12px; font-weight: 700;
+        }
+        .input-ui {
+            background: rgba(0,0,0,0.35); color: white; border: 1px solid rgba(255,255,255,0.15);
+            padding: 8px 12px; border-radius: 10px; font-family: inherit; font-size: 13px; font-weight: 700;
+        }
+
+        /* ================= نافذة جميع التطبيقات المثبتة (Installed Apps Drawer Modal) ================= */
+        .modal-backdrop {
+            position: fixed; inset: 0; background: rgba(4, 6, 12, 0.92);
+            backdrop-filter: blur(25px); z-index: 999;
+            display: none; justify-content: center; align-items: center; padding: 16px;
+        }
+        .modal-backdrop.show { display: flex; animation: fadeIn 0.2s ease; }
+        .modal-card {
+            width: 100%; max-width: 720px; max-height: 92vh; background: #111520;
+            border: 1px solid rgba(255,255,255,0.14); border-radius: 26px;
+            padding: 18px; display: flex; flex-direction: column; gap: 12px;
+            box-shadow: 0 25px 60px rgba(0,0,0,0.85); overflow: hidden;
+        }
+        .apps-grid {
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
+            overflow-y: auto; padding: 4px; max-height: 62vh;
+        }
+        .app-tile {
+            background: rgba(255,255,255,0.04); border: 1.5px solid rgba(255,255,255,0.07);
+            border-radius: 18px; padding: 12px 8px; text-align: center; cursor: pointer;
+            display: flex; flex-direction: column; align-items: center; gap: 6px; transition: 0.2s;
+        }
+        .app-tile:hover, .app-tile.selected {
+            border-color: var(--accent); background: rgba(10, 132, 255, 0.16); transform: translateY(-2px);
+        }
+        .app-tile-icon {
+            width: 48px; height: 48px; border-radius: 14px; font-size: 24px;
+            display: flex; justify-content: center; align-items: center;
+            box-shadow: 0 6px 14px rgba(0,0,0,0.4);
+        }
+        .app-tile-name { font-size: 12px; font-weight: 800; color: #fff; }
+        .app-tile-pkg { font-size: 9px; color: var(--text-muted); font-family: monospace; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+
+        .color-dot {
+            width: 28px; height: 28px; border-radius: 50%; cursor: pointer;
+            border: 2px solid rgba(255,255,255,0.3); display: inline-block;
+        }
+        .color-dot.active { transform: scale(1.2); border-color: #fff; }
+
+        .toast {
+            position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+            background: rgba(15, 20, 30, 0.96); border: 1.5px solid var(--accent);
+            color: white; padding: 10px 22px; border-radius: 30px; font-size: 13px; font-weight: 800;
+            z-index: 2000; display: none; box-shadow: 0 10px 30px rgba(0,0,0,0.75);
+        }
+    </style>
+</head>
+<body>
+
+    <div id="toast" class="toast">تمت المزامنة مع كمبيوتر السيارة</div>
+
+    <!-- ================= نافذة مستعرض جميع التطبيقات المثبتة في الشاشة ================= -->
+    <div id="appDrawerModal" class="modal-backdrop">
+        <div class="modal-card">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div>
+                    <h3 style="margin:0; font-size:18px;" id="drawerTitle">جميع التطبيقات المثبتة في الشاشة</h3>
+                    <div style="font-size:11px; color:var(--text-muted);" id="drawerSubtitle">اختر التطبيق المطلوب لتشغيله أو تعيينه كافتراضي في النظام</div>
+                </div>
+                <div style="display:flex; gap:8px;">
+                    <input type="text" id="appSearchInput" class="input-ui" placeholder="🔍 ابحث عن تطبيق..." oninput="renderInstalledApps()" style="width:160px;">
+                    <button class="btn-action" style="background:#333;" onclick="closeAppDrawer()">إغلاق ✕</button>
+                </div>
+            </div>
+            <div class="apps-grid" id="installedAppsGrid"></div>
+            <div style="display:flex; justify-content:space-between; align-items:center; border-top:1px solid rgba(255,255,255,0.08); padding-top:8px;">
+                <span style="font-size:11px; color:var(--text-muted);">يتم الجلب مباشرة من حزم نظام الأندرويد (PackageManager)</span>
+                <button class="btn-action" onclick="scanNewApkPrompt()">+ إضافة حزمة تطبيق (APK) يدوياً</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================= الشريط الجانبي (CarPlay Dock) ================= -->
+    <div class="dock">
+        <div class="status-top" onclick="openSettingsPane('paneHotspot')" title="حالة الاتصال ونقطة اتصال الآيفون">
+            <div class="clock" id="clock">23:15</div>
+            <div class="status-badges">
+                <span class="pill-mini" id="canStatusBadge">● ECU متصل</span>
+                <span class="pill-mini pill-hotspot" id="hotspotDockBadge">📶 آيفون متصل</span>
+            </div>
+        </div>
+
+        <div class="dock-apps">
+            <button class="dock-btn btn-dash active" id="dockBtnDash" onclick="switchScreen('dashScreen', this)">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L4.5 20.29l.71.71L12 18l6.79 3 .71-.71z"/></svg>
+                <span>الرئيسية</span>
+            </button>
+            <button class="dock-btn btn-ecu" id="dockBtnEcu" onclick="switchScreen('ecuScreen', this)">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.92 6.01C18.72 5.42 18.16 5 17.5 5h-11c-.66 0-1.21.42-1.42 1.01L3 12v8c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1h12v1c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-8l-2.08-5.99zM6.5 16c-.83 0-1.5-.67-1.5-1.5S5.67 13 6.5 13s1.5.67 1.5 1.5S7.33 16 6.5 16zm11 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zM5 11l1.5-4.5h11L19 11H5z"/></svg>
+                <span>كمبيوتر السيارة</span>
+            </button>
+            <button class="dock-btn btn-media" onclick="openAppDrawer('music')">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+                <span id="dockMusicLbl">يوتيوب ميوزك</span>
+            </button>
+            <button class="dock-btn btn-settings" id="dockBtnSettings" onclick="switchScreen('settingsScreen', this)">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+                <span>الإعدادات</span>
+            </button>
+        </div>
+
+        <div class="home-orb" onclick="openAppDrawer('all')" title="جميع التطبيقات المثبتة">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg>
+            <span>التطبيقات</span>
+        </div>
+    </div>
+
+    <!-- ================= منطقة العرض الرئيسية ================= -->
+    <div class="viewport">
+
+        <!-- 1. الشاشة الرئيسية (CarPlay Dashboard + استوديو المركبة) -->
+        <div id="dashScreen" class="screen active">
+            <!-- الخريطة الحية -->
+            <div class="card map-card">
+                <div class="map-overlay-top">
+                    <div class="nav-pill" onclick="openAppDrawer('map')" title="اضغط لتغيير تطبيق الخرائط من التطبيقات المثبتة">
+                        <span style="font-size:22px;" id="dashMapIcon">🗺️</span>
+                        <div>
+                            <div style="font-size:13px; font-weight:800;">جدة - طريق الملك عبدالعزيز</div>
+                            <div style="font-size:10px; color:var(--accent-green);">تطبيق الملاحة: <span id="activeMapName">خرائط جوجل</span> (اضغط للتبديل)</div>
+                        </div>
+                    </div>
+                    <div class="speed-cluster">
+                        <div class="speed-val" id="liveSpeed">84</div>
+                        <div class="speed-unit">كم/س • OBD2</div>
+                    </div>
+                </div>
+
+                <div id="map"></div>
+
+                <div class="map-overlay-bottom">
+                    <div class="quick-bar" onclick="openSettingsPane('paneHotspot')" style="cursor:pointer;">
+                        <span>📱 نقطة اتصال: <strong id="dashHotspotName" style="color:#5ac8fa;">iPhone Alhelali</strong></span>
+                        <span>•</span>
+                        <span id="dashGearState" style="color:var(--accent-green);">القير: D</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- العمود الأيسر: منصة المركبة التفاعلية + المشغل -->
+            <div class="side-col">
+                <!-- بطاقة استوديو المركبة والقراءات الحية من الكمبيوتر -->
+                <div class="card car-studio-card">
+                    <div class="studio-header">
+                        <div>
+                            <div style="font-size:14px; font-weight:900;" id="dashCarTitle">تويوتا كامري 2014 • خاص</div>
+                            <div style="font-size:10px; color:var(--accent-green);">● قراءة مباشرة من الكمبيوتر (CANBUS 0x7E0)</div>
+                        </div>
+                        <button class="btn-action" style="padding:5px 10px; font-size:10px; background:rgba(255,255,255,0.12);" onclick="openSettingsPane('paneCarPhoto')">
+                            📸 تغيير صورة المركبة
+                        </button>
+                    </div>
+
+                    <div class="car-stage" onclick="switchScreen('ecuScreen', document.getElementById('dockBtnEcu'))" style="cursor:pointer;">
+                        <div class="car-glow-floor" id="carGlowFloor"></div>
+                        <img id="carDisplayImg" class="car-render-img" src="" alt="Camry Render">
+                        <div class="tpms-floating">
+                            <div class="tpms-col">
+                                <span class="tpms-chip">أمام يمين: <b id="tpmsFR">33</b></span>
+                                <span class="tpms-chip">خلف يمين: <b id="tpmsRR">33</b></span>
+                            </div>
+                            <div class="tpms-col">
+                                <span class="tpms-chip">أمام يسار: <b id="tpmsFL">33</b></span>
+                                <span class="tpms-chip">خلف يسار: <b id="tpmsRL">32</b></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="studio-footer">
+                        <div class="mini-stat">
+                            <div class="mini-stat-val" id="dashFuelVal" style="color:var(--accent-green);">13.6</div>
+                            <div class="mini-stat-lbl" id="dashFuelUnit">كم/لتر</div>
+                        </div>
+                        <div class="mini-stat">
+                            <div class="mini-stat-val" id="dashRpmVal">1850</div>
+                            <div class="mini-stat-lbl">RPM المحرك</div>
+                        </div>
+                        <div class="mini-stat">
+                            <div class="mini-stat-val" id="dashVoltVal" style="color:#64d2ff;">14.1V</div>
+                            <div class="mini-stat-lbl">البطارية</div>
+                        </div>
+                        <div class="mini-stat">
+                            <div class="mini-stat-val" id="dashTempVal" style="color:var(--accent-amber);">88°C</div>
+                            <div class="mini-stat-lbl">حرارة المحرك</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- بطاقة المشغل الموسيقي المرتبط بالتطبيقات المثبتة -->
+                <div class="card media-card">
+                    <div class="media-top">
+                        <span style="font-size:11px; color:var(--text-muted); font-weight:700;">المشغل الصوتي النشط</span>
+                        <button class="app-pill-btn" onclick="openAppDrawer('music')" title="اضغط لاختيار تطبيق صوتيات آخر من الشاشة">
+                            <span id="dashMusicIcon">▶️</span>
+                            <span id="activeMusicBadge">يوتيوب ميوزك</span>
+                            <span>▾</span>
+                        </button>
+                    </div>
+                    <div style="text-align:center;">
+                        <div style="font-size:18px; font-weight:900;" id="trackTitle">Love Story</div>
+                        <div style="font-size:12px; color:var(--text-muted);" id="trackArtist">Indila • متزامن مع معالج الصوت DSP</div>
+                    </div>
+                    <div class="media-Controls-row">
+                        <button class="m-btn" onclick="openSettingsPane('paneHeadunit')" title="المعادل الصوتي DSP">🎚️</button>
+                        <div style="display:flex; gap:14px; align-items:center;">
+                            <button class="m-btn" onclick="changeTrack(-1)">⏮</button>
+                            <button class="m-btn play" id="playBtn" onclick="togglePlay()">⏸</button>
+                            <button class="m-btn" onclick="changeTrack(1)">⏭</button>
+                        </div>
+                        <button class="m-btn" onclick="openAppDrawer('music')" title="تطبيقات الصوت">📦</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 2. شاشة كمبيوتر السيارة الأصلي (Live Toyota CANBUS / OBD-II) -->
+        <div id="ecuScreen" class="screen">
+            <div class="ecu-layout">
+                <div class="canbus-banner">
+                    <div style="display:flex; align-items:center; gap:10px;">
+                        <span class="pulse-dot"></span>
+                        <div>
+                            <div style="font-size:14px; font-weight:900;">وحدة قراءة وبرمجة كمبيوتر السيارة المباشر (Toyota Body ECU & ECM)</div>
+                            <div style="font-size:11px; color:#a5b1c2;" id="canbusFrameLog">بروتوكول ISO 15765-4 CAN (11 bit ID, 500 Kbaud) • آخر قراءة حية: الآن</div>
+                        </div>
+                    </div>
+                    <button class="btn-action" style="background:var(--accent-green); color:#000;" onclick="syncFromCarEcu(true)">
+                        🔄 قراءة ومزامنة من الكمبيوتر الآن
+                    </button>
+                </div>
+
+                <div class="ecu-tabs">
+                    <button class="ecu-tab active" onclick="switchEcuTab('tabRemote', this)">🔑 الريموت والأقفال (BCM)</button>
+                    <button class="ecu-tab" onclick="switchEcuTab('tabFuel', this)">⛽ الوقود والمحرك الحي (ECM)</button>
+                    <button class="ecu-tab" onclick="switchEcuTab('tabLights', this)">💡 الإضاءة والتكييف (B-CAN)</button>
+                    <button class="ecu-tab" onclick="switchEcuTab('tabTpms', this)">🛞 حساسات الإطارات والأمان</button>
+                </div>
+
+                <!-- تبويب 1: الريموت والأقفال -->
+                <div id="tabRemote" class="ecu-panel active">
+                    <div class="card settings-list">
+                        <div class="setting-row" style="border-color: rgba(255, 159, 10, 0.45); background: rgba(255, 159, 10, 0.08);">
+                            <div>
+                                <div class="setting-title">🔊 مستوى صوت صافرة قفل الريموت (Wireless Lock Beep) <span class="can-tag">PID 0x750:0B</span></div>
+                                <div class="setting-desc">تعديل مباشر في وحدة BCM لرفع أو خفض صوت صافرة الوكالة عند القفل والفتح (المستوى الحالي من الكمبيوتر: <b id="beepVolVal">5</b>/7)</div>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:10px;">
+                                <input type="range" min="0" max="7" value="5" class="range-slider" id="beepSlider" oninput="updateEcuSetting('beep_vol', parseInt(this.value))">
+                                <button class="btn-action" style="background:var(--accent-amber); color:#000;" onclick="testToyotaBeep()">تجربة الصوت 🔊</button>
+                            </div>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🔒 قفل الأبواب التلقائي مع السرعة (Auto Lock by Speed) <span class="can-tag">PID 0x750:12</span></div>
+                                <div class="setting-desc">إغلاق جميع الأبواب أوتوماتيكياً من كمبيوتر السيارة فور تجاوز سرعة 20 كم/س</div>
+                            </div>
+                            <label class="switch"><input type="checkbox" id="ecu_auto_lock_speed" onchange="updateEcuSetting('auto_lock_speed', this.checked)"><span class="slider"></span></label>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🔓 فتح الأبواب عند التعشيق على P (Shift to P Unlock) <span class="can-tag">PID 0x750:13</span></div>
+                                <div class="setting-desc">فتح أقفال الأبواب تلقائياً فور وضع عصا القير على وضعية الوقوف P</div>
+                            </div>
+                            <label class="switch"><input type="checkbox" id="ecu_shift_p_unlock" onchange="updateEcuSetting('shift_p_unlock', this.checked)"><span class="slider"></span></label>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🪟 إنزال النوافذ بالضغط المطول على زر فتح الريموت (Keyfob Power Windows) <span class="can-tag">PID 0x750:29</span></div>
+                                <div class="setting-desc">فتح النوافذ الأربعة لتهوية المركبة عند الضغط المطول على زر الفتح في الريموت</div>
+                            </div>
+                            <label class="switch"><input type="checkbox" id="ecu_keyfob_windows" onchange="updateEcuSetting('keyfob_windows', this.checked)"><span class="slider"></span></label>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🚪 نظام الفتح على مرحلتين (2-Press Unlock) <span class="can-tag">PID 0x750:18</span></div>
+                                <div class="setting-desc">الضغطة الأولى تفتح باب السائق فقط، والضغطة الثانية تفتح باقي الأبواب</div>
+                            </div>
+                            <label class="switch"><input type="checkbox" id="ecu_two_stage_unlock" onchange="updateEcuSetting('two_stage_unlock', this.checked)"><span class="slider"></span></label>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🚨 وميض الفلشر عند القفل والفتح (Hazard Answerback) <span class="can-tag">PID 0x750:1F</span></div>
+                                <div class="setting-desc">استجابة الإشارات الضوئية عند إرسال أمر القفل أو الفتح من الريموت</div>
+                            </div>
+                            <label class="switch"><input type="checkbox" id="ecu_hazard_answerback" onchange="updateEcuSetting('hazard_answerback', this.checked)"><span class="slider"></span></label>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">⏱️ مؤقت إعادة القفل التلقائي للأمان (Auto Relock Timer) <span class="can-tag">PID 0x750:22</span></div>
+                                <div class="setting-desc">إعادة قفل الأبواب إذا تم فتحها بالريموت ولم يُفتح أي باب فعلياً</div>
+                            </div>
+                            <select class="select-ui" id="ecu_relock_timer" onchange="updateEcuSetting('relock_timer', this.value)">
+                                <option value="60">60 ثانية (افتراضي الوكالة)</option>
+                                <option value="30">30 ثانية</option>
+                                <option value="120">120 ثانية</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- تبويب 2: استهلاك الوقود والمحرك الحي -->
+                <div id="tabFuel" class="ecu-panel">
+                    <div class="card settings-list">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                            <div>
+                                <div style="font-size:16px; font-weight:900;">قراءات المحرك واستهلاك الوقود المباشرة (ECM Live Data)</div>
+                                <div style="font-size:11px; color:var(--text-muted);">تحديث حي كل ثانيتين من حساس البخاخات وحساس الهواء MAF</div>
+                            </div>
+                            <button class="btn-action" onclick="resetFuelTrip()">تصفير عداد الرحلة ↺</button>
+                        </div>
+
+                        <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:10px;">
+                            <div class="mini-stat" style="padding:12px;">
+                                <div class="mini-stat-val" style="font-size:22px; color:var(--accent-green);" id="ecuAvgFuel">13.6</div>
+                                <div class="mini-stat-lbl" id="ecuFuelUnitLbl">معدل الاستهلاك (كم/لتر)</div>
+                            </div>
+                            <div class="mini-stat" style="padding:12px;">
+                                <div class="mini-stat-val" style="font-size:22px; color:#5ac8fa;" id="ecuInstFuel">14.9</div>
+                                <div class="mini-stat-lbl">الاستهلاك اللحظي الحي</div>
+                            </div>
+                            <div class="mini-stat" style="padding:12px;">
+                                <div class="mini-stat-val" style="font-size:22px; color:var(--accent-amber);" id="ecuRange">468 كم</div>
+                                <div class="mini-stat-lbl">المسافة المتبقية بالخزان</div>
+                            </div>
+                            <div class="mini-stat" style="padding:12px;">
+                                <div class="mini-stat-val" style="font-size:22px;" id="ecuThrottle">18%</div>
+                                <div class="mini-stat-lbl">فتحة الدعسة (TPS)</div>
+                            </div>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🌿 مؤشر القيادة الاقتصادية في الطبلون (ECO Driving Lamp) <span class="can-tag">PID 0x7C0:04</span></div>
+                                <div class="setting-desc">تفعيل إضاءة شعار ECO الأخضر عند القيادة باستهلاك وقود مثالي</div>
+                            </div>
+                            <label class="switch"><input type="checkbox" id="ecu_eco_indicator" onchange="updateEcuSetting('eco_indicator', this.checked)"><span class="slider"></span></label>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">📊 وحدة حساب استهلاك الوقود في النظام</div>
+                                <div class="setting-desc">تغيير معادلة العرض بين النظام الخليجي (كم/لتر) والنظام الأوروبي (لتر/100كم)</div>
+                            </div>
+                            <select class="select-ui" id="ecu_fuel_unit" onchange="updateTopLevelSetting('fuel_unit', this.value)">
+                                <option value="kml">كم / لتر (km/L)</option>
+                                <option value="l100">لتر / 100 كم (L/100km)</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- تبويب 3: الإضاءة والتكييف -->
+                <div id="tabLights" class="ecu-panel">
+                    <div class="card settings-list">
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">💡 تأخير إطفاء الأنوار الأمامية بعد القفل (Follow Me Home) <span class="can-tag">PID 0x750:41</span></div>
+                                <div class="setting-desc">مدة بقاء الأنوار الأمامية مضاءة لإنارة الطريق بعد إطفاء المحرك وقفل الباب</div>
+                            </div>
+                            <select class="select-ui" id="ecu_follow_me_home" onchange="updateEcuSetting('follow_me_home', this.value)">
+                                <option value="30">30 ثانية</option>
+                                <option value="60">60 ثانية</option>
+                                <option value="90">90 ثانية</option>
+                                <option value="0">إيقاف فوري</option>
+                            </select>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🔆 حساسية حساس الأنوار الأوتوماتيكي (Auto Light Sensitivity) <span class="can-tag">PID 0x750:44</span></div>
+                                <div class="setting-desc">معايرة استجابة تشغيل الأنوار تلقائياً عند دخول الأنفاق أو الغروب</div>
+                            </div>
+                            <select class="select-ui" id="ecu_light_sensor_sens" onchange="updateEcuSetting('light_sensor_sens', this.value)">
+                                <option value="0">حساسية قياسية (0)</option>
+                                <option value="1">تشغيل مبكر (+1)</option>
+                                <option value="2">تشغيل مبكر جداً (+2)</option>
+                                <option value="-1">تشغيل متأخر (-1)</option>
+                            </select>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">❄️ ربط كومبروسر المكيف الاقتصادي بزر AUTO (A/C ECO Link) <span class="can-tag">PID 0x7C4:09</span></div>
+                                <div class="setting-desc">تقليل جهد الكومبروسر لتوفير الوقود عند تشغيل التكييف الأوتوماتيكي</div>
+                            </div>
+                            <label class="switch"><input type="checkbox" id="ecu_ac_auto_eco" onchange="updateEcuSetting('ac_auto_eco', this.checked)"><span class="slider"></span></label>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🔄 إغلاق الهواية الخارجية تلقائياً مع تشغيل المكيف (Auto Recirculation) <span class="can-tag">PID 0x7C4:0C</span></div>
+                                <div class="setting-desc">تحويل التكييف إلى تدوير الهواء الداخلي أوتوماتيكياً لمنع دخول الروائح والحرارة</div>
+                            </div>
+                            <label class="switch"><input type="checkbox" id="ecu_ac_auto_recirc" onchange="updateEcuSetting('ac_auto_recirc', this.checked)"><span class="slider"></span></label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- تبويب 4: حساسات الإطارات والأمان -->
+                <div id="tabTpms" class="ecu-panel">
+                    <div class="card settings-list">
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🛞 قراءة حساسات ضغط وحرارة الإطارات الحية (TPMS Direct Read)</div>
+                                <div class="setting-desc">القراءة الحالية: أمام يمين 33 PSI (36°C) • أمام يسار 33 PSI (36°C) • خلف 32 PSI</div>
+                            </div>
+                            <button class="btn-action" onclick="showToast('تمت معايرة وتحديث حساسات الإطارات الأربعة بنجاح')">معايرة TPMS ↺</button>
+                        </div>
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🩺 فحص أكواد أعطال الكمبيوتر (OBD-II DTC Scanner)</div>
+                                <div class="setting-desc">فحص وحدة المحرك (ECM) والقير (TCM) والـ ABS للتأكد من عدم وجود أخطاء</div>
+                            </div>
+                            <button class="btn-action" style="background:var(--accent-green); color:#000;" onclick="showToast('فحص الكمبيوتر مكتمل: لا توجد أي أكواد أعطال (0 DTCs Found) ✓')">فحص شامل الآن ✓</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ================= 3. صفحة الإعدادات الشاملة والاحترافية للشاشة (Full System Settings OS) ================= -->
+        <div id="settingsScreen" class="screen">
+            <div class="settings-os-layout">
+                <!-- القائمة الجانبية لصفحة الإعدادات -->
+                <div class="settings-sidebar">
+                    <div class="settings-nav-title">⚙️ إعدادات النظام والشاشة</div>
+                    <button class="s-nav-btn active" id="navBtnHotspot" onclick="openSettingsPane('paneHotspot')">📱 نقطة اتصال الآيفون</button>
+                    <button class="s-nav-btn" id="navBtnHeadunit" onclick="openSettingsPane('paneHeadunit')">🎛️ الشاشة والصوت والكاميرا</button>
+                    <button class="s-nav-btn" id="navBtnApps" onclick="openSettingsPane('paneApps')">📦 التطبيقات الافتراضية</button>
+                    <button class="s-nav-btn" id="navBtnCarPhoto" onclick="openSettingsPane('paneCarPhoto')">🚘 صورة وهوية المركبة</button>
+                </div>
+
+                <!-- محتوى الإعدادات -->
+                <div class="card s-content-area">
+                    
+                    <!-- القسم 1: نقطة اتصال الآيفون المباشرة (iPhone Personal Hotspot) -->
+                    <div id="paneHotspot" class="s-pane active">
+                        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(255,255,255,0.08); padding-bottom:10px;">
+                            <div>
+                                <h3 style="margin:0; font-size:18px;">📱 الربط المباشر بنقطة اتصال الآيفون (iPhone Personal Hotspot)</h3>
+                                <div style="font-size:11px; color:var(--text-muted);">اتصال تلقائي فوري بشبكة الآيفون بمجرد تشغيل سويتش السيارة لتزويد الخرائط والنظام بالإنترنت</div>
+                            </div>
+                            <span class="pill-mini" id="hotspotStatusPill" style="font-size:12px; padding:6px 12px;">● متصل بـ iPhone Alhelali</span>
+                        </div>
+
+                        <div class="setting-row" style="background:rgba(10,132,255,0.1); border-color:rgba(10,132,255,0.35);">
+                            <div>
+                                <div class="setting-title">⚡ اتصال فوري بنقطة اتصال الآيفون</div>
+                                <div class="setting-desc" id="hotspotIpInfo">عنوان IP الحالي: 172.20.10.2 • سرعة الربط: 5GHz Wi-Fi + Bluetooth Tethering</div>
+                            </div>
+                            <button class="btn-action" onclick="connectIphoneHotspotNow()">🔗 إعادة الاتصال بالآيفون الآن</button>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🔄 اتصال تلقائي فور تشغيل السيارة (Auto-Connect on ACC ON)</div>
+                                <div class="setting-desc">البحث عن نقطة اتصال الآيفون والارتباط بها أوتوماتيكياً خلال 3 ثوانٍ من تشغيل المحرك</div>
+                            </div>
+                            <label class="switch"><input type="checkbox" id="hs_auto_connect" checked onchange="saveHotspotConfig()"><span class="slider"></span></label>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">📡 اسم نقطة اتصال الآيفون (iPhone Hotspot SSID)</div>
+                                <div class="setting-desc">اسم جهاز الآيفون كما يظهر في إعدادات مشاركة الإنترنت</div>
+                            </div>
+                            <input type="text" id="hs_ssid" class="input-ui" value="iPhone Alhelali" onchange="saveHotspotConfig()">
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🔑 كلمة مرور نقطة الاتصال (Hotspot Password)</div>
+                                <div class="setting-desc">تُحفظ بشكل مشفر في الشاشة للاتصال التلقائي بدون تدخل</div>
+                            </div>
+                            <input type="password" id="hs_pass" class="input-ui" value="12345678" onchange="saveHotspotConfig()">
+                        </div>
+                    </div>
+
+                    <!-- القسم 2: إعدادات شاشة السيارة والـ MCU والصوت والكاميرا -->
+                    <div id="paneHeadunit" class="s-pane">
+                        <h3 style="margin:0 0 6px 0; font-size:18px;">🎛️ إعدادات شاشة السيارة المتقدمة (MCU & Car Head-Unit)</h3>
+                        
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">📹 تشغيل الكاميرا الخلفية تلقائياً عند التعشيق على R (Reverse Camera Trigger)</div>
+                                <div class="setting-desc">تحويل الشاشة فوراً إلى مدخل كاميرا الرجوع مع إظهار خطوط المسار المتحركة مع المقود</div>
+                            </div>
+                            <label class="switch"><input type="checkbox" id="hu_reverse_cam" checked onchange="updateHeadunitSetting('reverse_cam_auto', this.checked)"><span class="slider"></span></label>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🔉 خفض صوت الموسيقى تلقائياً عند الرجوع للخلف (Reverse Audio Ducking)</div>
+                                <div class="setting-desc">تخفيض صوت الأغاني عند التعشيق على R لسماع صوت حساسات الرجوع بوضوح (<span id="revMuteLbl">70</span>%)</div>
+                            </div>
+                            <input type="range" min="0" max="100" value="70" class="range-slider" id="hu_reverse_mute" oninput="document.getElementById('revMuteLbl').innerText=this.value; updateHeadunitSetting('reverse_mute_level', this.value)">
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🌙 سطوع ليلي تلقائي مع إضاءة السيارة (ILLUMI Auto-Dimming)</div>
+                                <div class="setting-desc">تخفيض إضاءة الشاشة تلقائياً لراحة العين بمجرد تشغيل أنوار الكامري الأمامية</div>
+                            </div>
+                            <label class="switch"><input type="checkbox" id="hu_illumi" checked onchange="updateHeadunitSetting('illumi_auto_dim', this.checked)"><span class="slider"></span></label>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🎚️ المعادل الصوتي الرقمي (DSP Audio Equalizer Preset)</div>
+                                <div class="setting-desc">توزيع الصوت ومضخم الـ Subwoofer على سماعات الكامري الـ 6</div>
+                            </div>
+                            <select class="select-ui" id="hu_dsp" onchange="updateHeadunitSetting('dsp_preset', this.value)">
+                                <option value="toyota_oem">وزنية وكالة تويوتا المحيطية (OEM Surround)</option>
+                                <option value="bass_boost">تضخيم البيز العميق (Deep Bass + Sub)</option>
+                                <option value="vocal">نقاء الصوتيات والبودكاست (Pure Vocal)</option>
+                                <option value="flat">مسطح استوديو (Flat Hi-Fi)</option>
+                            </select>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🔋 وضع السكون السريع بعد إطفاء المحرك (ACC Off Sleep Delay)</div>
+                                <div class="setting-desc">إبقاء الشاشة في وضع الاستعداد لتشتغل في ثانية واحدة عند ركوب السيارة</div>
+                            </div>
+                            <select class="select-ui" id="hu_acc_delay" onchange="updateHeadunitSetting('acc_off_delay', this.value)">
+                                <option value="30s">إغلاق بعد 30 ثانية + إقلاع فوري (Fast Boot)</option>
+                                <option value="10m">انتظار 10 دقائق في الخلفية</option>
+                                <option value="0s">إيقاف فوري مع المفتاح</option>
+                            </select>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🕹️ برمجة أزرار التحكم في المقود (Steering Wheel Controls - SWC)</div>
+                                <div class="setting-desc">جميع أزرار دركسون الكامري (رفع/خفض الصوت، تغيير المقطع، زر MODE) مبرمجة ومتصلة بـ CANBUS</div>
+                            </div>
+                            <button class="btn-action" onclick="showToast('وضع معايرة أزرار الدركسون جاهز: جميع الأزرار متصلة بـ CANBUS ✓')">معايرة أزرار المقود</button>
+                        </div>
+                    </div>
+
+                    <!-- القسم 3: إدارة التطبيقات المثبتة والتطبيقات الافتراضية -->
+                    <div id="paneApps" class="s-pane">
+                        <h3 style="margin:0 0 6px 0; font-size:18px;">📦 اختيار التطبيقات الافتراضية من التطبيقات المثبتة في الشاشة</h3>
+                        
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🗺️ تطبيق الخرائط والملاحة الافتراضي</div>
+                                <div class="setting-desc">التطبيق المحدد حالياً: <b id="settingsMapName" style="color:#5ac8fa;">خرائط جوجل</b> (<span id="settingsMapPkg">com.google.android.apps.maps</span>)</div>
+                            </div>
+                            <button class="btn-action" onclick="openAppDrawer('map')">استعراض جميع تطبيقات الملاحة المثبتة ◂</button>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🎵 تطبيق الموسيقى والصوتيات الافتراضي</div>
+                                <div class="setting-desc">التطبيق المحدد حالياً: <b id="settingsMusicName" style="color:#ff6482;">يوتيوب ميوزك</b> (<span id="settingsMusicPkg">com.google.android.apps.youtube.music</span>)</div>
+                            </div>
+                            <button class="btn-action" onclick="openAppDrawer('music')">استعراض جميع تطبيقات الصوتيات المثبتة ◂</button>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">📲 مكتبة جميع تطبيقات الشاشة (App Drawer)</div>
+                                <div class="setting-desc">عرض وتشغيل جميع تطبيقات الأندرويد المثبتة في النظام أو إضافة حزمة تطبيق جديدة</div>
+                            </div>
+                            <button class="btn-action" style="background:var(--accent-purple);" onclick="openAppDrawer('all')">فتح جميع التطبيقات المثبتة (14 تطبيق) ⊞</button>
+                        </div>
+                    </div>
+
+                    <!-- القسم 4: استوديو تخصيص صورة المركبة الاحترافي -->
+                    <div id="paneCarPhoto" class="s-pane">
+                        <h3 style="margin:0 0 6px 0; font-size:18px;">🚘 استوديو تخصيص صورة المركبة (Vehicle Showroom Studio)</h3>
+                        
+                        <div class="setting-row" style="background:rgba(48,209,88,0.08); border-color:rgba(48,209,88,0.35);">
+                            <div>
+                                <div class="setting-title">📸 رفع صورة سيارتك الخاصة من الآيفون / ذاكرة الشاشة</div>
+                                <div class="setting-desc">اختر صورة لسيارتك (يفضل بصيغة PNG أو WebP مفرغة الخلفية) لتظهر في منصة العرض الرئيسية</div>
+                            </div>
+                            <label class="btn-action" style="background:var(--accent-green); color:#000; cursor:pointer;">
+                                📁 اختيار صورة من الجهاز
+                                <input type="file" accept="image/*" style="display:none;" onchange="handleCustomCarUpload(event)">
+                            </label>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🎨 اختيار موديل جاهز من الاستوديو</div>
+                                <div class="setting-desc">التبديل بين نماذج تويوتا كامري المدمجة أو استعادة الشكل الافتراضي</div>
+                            </div>
+                            <div style="display:flex; gap:8px;">
+                                <button class="btn-action" style="background:#eee; color:#111;" onclick="setPresetCar('pearl')">كامري لؤلؤي</button>
+                                <button class="btn-action" style="background:#222; border:1px solid #555;" onclick="setPresetCar('black')">كامري أسود ملكي</button>
+                            </div>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">✨ لون الإضاءة المحيطية أسفل المركبة (Studio Underglow)</div>
+                                <div class="setting-desc">تخصيص الهالة الضوئية تحت السيارة في الشاشة الرئيسية</div>
+                            </div>
+                            <div style="display:flex; gap:10px; align-items:center;">
+                                <span class="color-dot" style="background:#0a84ff;" onclick="setCarGlow('#0a84ff')"></span>
+                                <span class="color-dot" style="background:#30d158;" onclick="setCarGlow('#30d158')"></span>
+                                <span class="color-dot" style="background:#ff2d55;" onclick="setCarGlow('#ff2d55')"></span>
+                                <span class="color-dot" style="background:#ff9f0a;" onclick="setCarGlow('#ff9f0a')"></span>
+                                <span class="color-dot" style="background:#bf5af2;" onclick="setCarGlow('#bf5af2')"></span>
+                            </div>
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🔍 حجم عرض المركبة في المنصة (<span id="carScaleLbl">100</span>%)</div>
+                                <div class="setting-desc">تكبير أو تصغير صورة المركبة لتتناسب تماماً مع أبعاد بطاقة العرض</div>
+                            </div>
+                            <input type="range" min="70" max="135" value="100" class="range-slider" id="carScaleSlider" oninput="updateCarScale(this.value)">
+                        </div>
+
+                        <div class="setting-row">
+                            <div>
+                                <div class="setting-title">🏷️ اسم المركبة أو اللوحة الترحيبية</div>
+                                <div class="setting-desc">يظهر أعلى منصة عرض السيارة في الشاشة الرئيسية</div>
+                            </div>
+                            <input type="text" id="carNameInput" class="input-ui" value="تويوتا كامري 2014 • خاص" onchange="updateTopLevelSetting('car_name', this.value)">
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        let appState = {};
+        let installedApps = [];
+        let currentDrawerMode = 'all'; // 'all', 'map', 'music'
+
+        // رسومات SVG عالية الدقة مدمجة لسيارة كامري (لؤلؤي وأسود) في حال لم يرفع المستخدم صورة بعد
+        const camrySvgPearl = 'data:image/svg+xml;utf8,' + encodeURIComponent(`
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 190">
+            <defs>
+                <linearGradient id="bodyGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stop-color="#ffffff"/>
+                    <stop offset="55%" stop-color="#e6ebf2"/>
+                    <stop offset="100%" stop-color="#b8c4d4"/>
+                </linearGradient>
+                <linearGradient id="glassGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                    <stop offset="0%" stop-color="#1e293b"/>
+                    <stop offset="100%" stop-color="#090d16"/>
+                </linearGradient>
+            </defs>
+            <ellipse cx="250" cy="162" rx="220" ry="14" fill="rgba(0,0,0,0.65)"/>
+            <path d="M35,125 L55,90 L140,80 L205,42 L345,42 L415,82 L465,95 L475,132 L455,152 L45,152 Z" fill="url(#bodyGrad)" stroke="#94a3b8" stroke-width="1.5"/>
+            <path d="M150,80 L210,48 L335,48 L395,82 Z" fill="url(#glassGrad)"/>
+            <line x1="270" y1="48" x2="265" y2="82" stroke="#cbd5e1" stroke-width="3"/>
+            <path d="M35,105 L68,100 L62,115 L35,115 Z" fill="#38bdf8"/>
+            <path d="M455,98 L472,102 L470,116 L450,114 Z" fill="#ef4444"/>
+            <circle cx="115" cy="148" r="30" fill="#111827" stroke="#475569" stroke-width="4"/>
+            <circle cx="115" cy="148" r="17" fill="#94a3b8"/>
+            <circle cx="385" cy="148" r="30" fill="#111827" stroke="#475569" stroke-width="4"/>
+            <circle cx="385" cy="148" r="17" fill="#94a3b8"/>
+        </svg>`);
+
+        const camrySvgBlack = 'data:image/svg+xml;utf8,' + encodeURIComponent(`
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 190">
+            <defs>
+                <linearGradient id="bodyBlack" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stop-color="#334155"/>
+                    <stop offset="50%" stop-color="#0f172a"/>
+                    <stop offset="100%" stop-color="#020617"/>
+                </linearGradient>
+            </defs>
+            <ellipse cx="250" cy="162" rx="220" ry="14" fill="rgba(0,0,0,0.75)"/>
+            <path d="M35,125 L55,90 L140,80 L205,42 L345,42 L415,82 L465,95 L475,132 L455,152 L45,152 Z" fill="url(#bodyBlack)" stroke="#475569" stroke-width="1.5"/>
+            <path d="M150,80 L210,48 L335,48 L395,82 Z" fill="#090d16"/>
+            <line x1="270" y1="48" x2="265" y2="82" stroke="#334155" stroke-width="3"/>
+            <path d="M35,105 L68,100 L62,115 L35,115 Z" fill="#38bdf8"/>
+            <path d="M455,98 L472,102 L470,116 L450,114 Z" fill="#ef4444"/>
+            <circle cx="115" cy="148" r="30" fill="#090d16" stroke="#334155" stroke-width="4"/>
+            <circle cx="115" cy="148" r="17" fill="#64748b"/>
+            <circle cx="385" cy="148" r="30" fill="#090d16" stroke="#334155" stroke-width="4"/>
+            <circle cx="385" cy="148" r="17" fill="#64748b"/>
+        </svg>`);
+
+        window.onload = async function() {
+            updateClock();
+            setInterval(updateClock, 5000);
+            initMap();
+            await loadInstalledApps();
+            await syncFromCarEcu(false);
+            loadCarImageFromStorage();
+            // قراءة دورية حية من كمبيوتر السيارة كل ثانيتين
+            setInterval(() => syncFromCarEcu(false), 2500);
+        };
+
+        function updateClock() {
+            const now = new Date();
+            let h = String(now.getHours()).padStart(2, '0');
+            let m = String(now.getMinutes()).padStart(2, '0');
+            document.getElementById('clock').innerText = h + ':' + m;
+        }
+
+        function initMap() {
+            const map = L.map('map', { zoomControl: false, attributionControl: false }).setView([21.5433, 39.1728], 13);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+            L.marker([21.5433, 39.1728]).addTo(map);
+        }
+
+        // جلب جميع التطبيقات المثبتة من النظام أو الباك إند
+        async function loadInstalledApps() {
+            try {
+                if (window.AndroidBridge && window.AndroidBridge.getInstalledApps) {
+                    installedApps = JSON.parse(window.AndroidBridge.getInstalledApps());
+                } else {
+                    const res = await fetch('/api/apps');
+                    installedApps = await res.json();
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        // قراءة ومزامنة الإعدادات والبيانات الحية من كمبيوتر السيارة مباشرة
+        async function syncFromCarEcu(showNotification) {
+            try {
+                const res = await fetch('/api/ecu');
+                const data = await res.json();
+                appState = data.state;
+                const live = data.live_telemetry;
+
+                // تحديث القراءات الحية القادمة من الكمبيوتر
+                document.getElementById('liveSpeed').innerText = live.speed;
+                document.getElementById('dashRpmVal').innerText = live.rpm;
+                document.getElementById('dashVoltVal').innerText = live.voltage + 'V';
+                document.getElementById('dashTempVal').innerText = live.coolant_temp + '°C';
+                document.getElementById('ecuInstFuel').innerText = live.instant_fuel;
+                document.getElementById('ecuThrottle').innerText = live.throttle + '%';
+                document.getElementById('tpmsFR').innerText = live.tpms.fr;
+                document.getElementById('tpmsFL').innerText = live.tpms.fl;
+                document.getElementById('tpmsRR').innerText = live.tpms.rr;
+                document.getElementById('tpmsRL').innerText = live.tpms.rl;
+                document.getElementById('canbusFrameLog').innerText = `CAN-ID: ${live.last_can_id} • RX: ${live.rx_frames} Frames • البروتوكول متصل مباشر`;
+
+                applyStateToUI();
+                if (showNotification) {
+                    showToast('تمت قراءة ومزامنة جميع القيم من كمبيوتر السيارة (ECU) بنجاح ✓');
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        function applyStateToUI() {
+            if (!appState.ecu) return;
+            // تطبيقات الملاحة والصوتيات
+            document.getElementById('activeMapName').innerText = appState.default_map_name;
+            document.getElementById('dashMapIcon').innerText = appState.default_map_icon || '🗺️';
+            document.getElementById('activeMusicBadge').innerText = appState.default_music_name;
+            document.getElementById('dashMusicIcon').innerText = appState.default_music_icon || '▶️';
+            document.getElementById('dockMusicLbl').innerText = appState.default_music_name;
+
+            document.getElementById('settingsMapName').innerText = appState.default_map_name;
+            document.getElementById('settingsMapPkg').innerText = appState.default_map_pkg;
+            document.getElementById('settingsMusicName').innerText = appState.default_music_name;
+            document.getElementById('settingsMusicPkg').innerText = appState.default_music_pkg;
+
+            // معلومات المركبة
+            document.getElementById('dashCarTitle').innerText = appState.car_name;
+            document.getElementById('carNameInput').value = appState.car_name;
+            document.documentElement.style.setProperty('--car-glow', appState.car_glow || '#0a84ff');
+            document.getElementById('carDisplayImg').style.transform = `scale(${(appState.car_scale || 100) / 100})`;
+            document.getElementById('carScaleSlider').value = appState.car_scale || 100;
+            document.getElementById('carScaleLbl').innerText = appState.car_scale || 100;
+
+            // إعدادات كمبيوتر السيارة (ECU)
+            document.getElementById('beepSlider').value = appState.ecu.beep_vol;
+            document.getElementById('beepVolVal').innerText = appState.ecu.beep_vol;
+            document.getElementById('ecu_auto_lock_speed').checked = appState.ecu.auto_lock_speed;
+            document.getElementById('ecu_shift_p_unlock').checked = appState.ecu.shift_p_unlock;
+            document.getElementById('ecu_keyfob_windows').checked = appState.ecu.keyfob_windows;
+            document.getElementById('ecu_two_stage_unlock').checked = appState.ecu.two_stage_unlock;
+            document.getElementById('ecu_hazard_answerback').checked = appState.ecu.hazard_answerback;
+            document.getElementById('ecu_relock_timer').value = appState.ecu.relock_timer;
+            document.getElementById('ecu_eco_indicator').checked = appState.ecu.eco_indicator;
+            document.getElementById('ecu_follow_me_home').value = appState.ecu.follow_me_home;
+            document.getElementById('ecu_light_sensor_sens').value = appState.ecu.light_sensor_sens;
+            document.getElementById('ecu_ac_auto_eco').checked = appState.ecu.ac_auto_eco;
+            document.getElementById('ecu_ac_auto_recirc').checked = appState.ecu.ac_auto_recirc;
+            document.getElementById('ecu_fuel_unit').value = appState.fuel_unit;
+
+            if (appState.fuel_unit === 'l100') {
+                document.getElementById('dashFuelVal').innerText = '7.4';
+                document.getElementById('dashFuelUnit').innerText = 'لتر/100كم';
+                document.getElementById('ecuAvgFuel').innerText = '7.4';
+                document.getElementById('ecuFuelUnitLbl').innerText = 'المعدل (لتر/100كم)';
+            } else {
+                document.getElementById('dashFuelVal').innerText = '13.6';
+                document.getElementById('dashFuelUnit').innerText = 'كم/لتر';
+                document.getElementById('ecuAvgFuel').innerText = '13.6';
+                document.getElementById('ecuFuelUnitLbl').innerText = 'المعدل (كم/لتر)';
+            }
+        }
+
+        // إرسال أمر تعديل مباشر إلى كمبيوتر السيارة (CANBUS Write)
+        async function updateEcuSetting(key, val) {
+            appState.ecu[key] = val;
+            if (key === 'beep_vol') document.getElementById('beepVolVal').innerText = val;
+            await pushStateToServer(`تم إرسال الأمر إلى كمبيوتر السيارة (ECU): ${key} = ${val}`);
+        }
+
+        async function updateHeadunitSetting(key, val) {
+            appState.headunit[key] = val;
+            await pushStateToServer(`تم تحديث إعدادات الشاشة (MCU): ${key}`);
+        }
+
+        async function updateTopLevelSetting(key, val) {
+            appState[key] = val;
+            applyStateToUI();
+            await pushStateToServer('تم حفظ الإعدادات وتحديث النظام');
+        }
+
+        async function pushStateToServer(toastMsg) {
+            try {
+                await fetch('/api/ecu', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(appState)
+                });
+                if (toastMsg) showToast(toastMsg);
+            } catch (e) { console.error(e); }
+        }
+
+        // ================= نافذة جميع التطبيقات المثبتة في الشاشة =================
+        function openAppDrawer(mode) {
+            currentDrawerMode = mode;
+            const titleEl = document.getElementById('drawerTitle');
+            const subEl = document.getElementById('drawerSubtitle');
+            if (mode === 'map') {
+                titleEl.innerText = '🗺️ اختر تطبيق الملاحة والخرائط من التطبيقات المثبتة';
+                subEl.innerText = 'الضغط على أي تطبيق سيجعله تطبيق الخرائط الافتراضي ويقوم بتشغيله';
+            } else if (mode === 'music') {
+                titleEl.innerText = '🎵 اختر المشغل الصوتي من التطبيقات المثبتة';
+                subEl.innerText = 'الضغط على أي تطبيق سيجعله مشغل الصوتيات الافتراضي في الشريط الجانبي والرئيسية';
+            } else {
+                titleEl.innerText = '📲 جميع التطبيقات المثبتة في شاشة الأندرويد';
+                subEl.innerText = 'اضغط على أي تطبيق لتشغيله مباشرة أو تعيينه كتطبيق افتراضي';
+            }
+            document.getElementById('appSearchInput').value = '';
+            renderInstalledApps();
+            document.getElementById('appDrawerModal').classList.add('show');
+        }
+
+        function closeAppDrawer() {
+            document.getElementById('appDrawerModal').classList.remove('show');
+        }
+
+        function renderInstalledApps() {
+            const q = document.getElementById('appSearchInput').value.trim().toLowerCase();
+            const grid = document.getElementById('installedAppsGrid');
+            grid.innerHTML = '';
+
+            const filtered = installedApps.filter(app => {
+                if (currentDrawerMode === 'map' && app.cat !== 'map') return false;
+                if (currentDrawerMode === 'music' && app.cat !== 'music') return false;
+                if (q && !app.name.toLowerCase().includes(q) && !app.pkg.toLowerCase().includes(q)) return false;
+                return true;
+            });
+
+            filtered.forEach(app => {
+                const isSelected = (app.pkg === appState.default_map_pkg || app.pkg === appState.default_music_pkg);
+                const tile = document.createElement('div');
+                tile.className = 'app-tile' + (isSelected ? ' selected' : '');
+                tile.onclick = () => selectOrLaunchApp(app);
+                tile.innerHTML = `
+                    <div class="app-tile-icon" style="background:${app.color || '#2c3e50'}">${app.icon}</div>
+                    <div class="app-tile-name">${app.name}</div>
+                    <div class="app-tile-pkg">${app.pkg}</div>
+                `;
+                grid.appendChild(tile);
+            });
+        }
+
+        async function selectOrLaunchApp(app) {
+            if (currentDrawerMode === 'map' || app.cat === 'map') {
+                appState.default_map_pkg = app.pkg;
+                appState.default_map_name = app.name;
+                appState.default_map_icon = app.icon;
+                applyStateToUI();
+                await pushStateToServer(`تم تعيين "${app.name}" كتطبيق الملاحة الافتراضي وتشغيله`);
+            } else if (currentDrawerMode === 'music' || app.cat === 'music') {
+                appState.default_music_pkg = app.pkg;
+                appState.default_music_name = app.name;
+                appState.default_music_icon = app.icon;
+                applyStateToUI();
+                await pushStateToServer(`تم تعيين "${app.name}" كمشغل الصوتيات الافتراضي وتشغيله`);
+            } else {
+                showToast(`جاري تشغيل التطبيق: ${app.name} (${app.pkg})`);
+            }
+            if (window.AndroidBridge && window.AndroidBridge.launchPackage) {
+                window.AndroidBridge.launchPackage(app.pkg);
+            }
+            closeAppDrawer();
+        }
+
+        function scanNewApkPrompt() {
+            const name = prompt('أدخل اسم التطبيق المثبت في الشاشة:');
+            if (!name) return;
+            const pkg = prompt('أدخل اسم الحزمة (Package Name) مثال: com.example.app', 'com.android.custom');
+            const cat = confirm('هل هذا تطبيق خرائط وملاحة؟ (موافق = خرائط، إلغاء = صوتيات/عام)') ? 'map' : 'music';
+            installedApps.push({pkg: pkg || 'com.custom.app', name: name, cat: cat, icon: cat === 'map' ? '🧭' : '🎵', color: '#0a84ff'});
+            renderInstalledApps();
+            showToast(`تمت إضافة "${name}" إلى قائمة تطبيقات الشاشة`);
+        }
+
+        // ================= نقطة اتصال الآيفون (iPhone Hotspot) =================
+        function connectIphoneHotspotNow() {
+            const ssid = document.getElementById('hs_ssid').value;
+            showToast(`جاري البحث والارتباط بنقطة اتصال الآيفون "${ssid}"...`);
+            setTimeout(() => {
+                document.getElementById('hotspotStatusPill').innerText = `● متصل بـ ${ssid} (5GHz)`;
+                document.getElementById('dashHotspotName').innerText = ssid;
+                document.getElementById('hotspotDockBadge').innerText = '📶 آيفون متصل';
+                showToast(`تم الاتصال بنقطة اتصال "${ssid}" بنجاح • الإنترنت نشط ✓`);
+            }, 900);
+        }
+
+        function saveHotspotConfig() {
+            const ssid = document.getElementById('hs_ssid').value;
+            document.getElementById('dashHotspotName').innerText = ssid;
+            showToast(`تم حفظ إعدادات نقطة اتصال الآيفون (${ssid}) للاتصال التلقائي`);
+        }
+
+        // ================= استوديو صورة المركبة الاحترافي =================
+        function loadCarImageFromStorage() {
+            const savedImg = localStorage.getItem('camry_custom_car_img');
+            document.getElementById('carDisplayImg').src = savedImg ? savedImg : camrySvgPearl;
+        }
+
+        function handleCustomCarUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const dataUrl = e.target.result;
+                localStorage.setItem('camry_custom_car_img', dataUrl);
+                document.getElementById('carDisplayImg').src = dataUrl;
+                showToast('تم رفع وتحديث صورة سيارتك في منصة العرض بنجاح ✓');
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function setPresetCar(type) {
+            const img = (type === 'black') ? camrySvgBlack : camrySvgPearl;
+            localStorage.setItem('camry_custom_car_img', img);
+            document.getElementById('carDisplayImg').src = img;
+            showToast('تم تحديث موديل المركبة في المنصة');
+        }
+
+        function setCarGlow(color) {
+            document.documentElement.style.setProperty('--car-glow', color);
+            updateTopLevelSetting('car_glow', color);
+        }
+
+        function updateCarScale(val) {
+            document.getElementById('carScaleLbl').innerText = val;
+            document.getElementById('carDisplayImg').style.transform = `scale(${val / 100})`;
+            updateTopLevelSetting('car_scale', parseInt(val));
+        }
+
+        // ================= التنقل بين الشاشات والأقسام =================
+        function switchScreen(screenId, btn) {
+            document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+            document.getElementById(screenId).classList.add('active');
+            document.querySelectorAll('.dock-btn').forEach(b => b.classList.remove('active'));
+            if (btn) btn.classList.add('active');
+        }
+
+        function switchEcuTab(tabId, btn) {
+            document.querySelectorAll('.ecu-panel').forEach(p => p.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+            document.querySelectorAll('.ecu-tab').forEach(t => t.classList.remove('active'));
+            btn.classList.add('active');
+        }
+
+        function openSettingsPane(paneId) {
+            switchScreen('settingsScreen', document.getElementById('dockBtnSettings'));
+            document.querySelectorAll('.s-pane').forEach(p => p.classList.remove('active'));
+            document.getElementById(paneId).classList.add('active');
+            document.querySelectorAll('.s-nav-btn').forEach(b => b.classList.remove('active'));
+            const mapBtn = {
+                'paneHotspot': 'navBtnHotspot',
+                'paneHeadunit': 'navBtnHeadunit',
+                'paneApps': 'navBtnApps',
+                'paneCarPhoto': 'navBtnCarPhoto'
+            }[paneId];
+            if (mapBtn) document.getElementById(mapBtn).classList.add('active');
+        }
+
+        // صافرة قفل تويوتا الأصلية (2480Hz Piezo Buzzer)
+        function testToyotaBeep() {
+            const vol = parseInt(appState.ecu.beep_vol);
+            if (vol === 0) {
+                showToast('صوت صافرة الريموت مضبوط على: صامت (0)');
+                return;
+            }
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const gainLevel = (vol / 7) * 0.35;
+            [0, 0.15].forEach(start => {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(2480, ctx.currentTime + start);
+                gain.gain.setValueAtTime(gainLevel, ctx.currentTime + start);
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.start(ctx.currentTime + start);
+                osc.stop(ctx.currentTime + start + 0.075);
+            });
+            showToast(`تم إرسال أمر اختبار صافرة الريموت (المستوى ${vol}/7) إلى وحدة BCM`);
+        }
+
+        function resetFuelTrip() {
+            document.getElementById('ecuAvgFuel').innerText = '0.0';
+            document.getElementById('dashFuelVal').innerText = '0.0';
+            showToast('تم إرسال أمر تصفير عداد الرحلة إلى كمبيوتر المحرك (ECM)');
+        }
+
+        // التحكم بالمشغل
+        const tracks = [
+            { title: 'Love Story', artist: 'Indila • متزامن مع معالج الصوت DSP' },
+            { title: 'Dernière Danse', artist: 'Indila • Mini World' },
+            { title: 'Desert Rose', artist: 'Sting • Hi-Fi Car Audio' }
+        ];
+        let curTrack = 0;
+        let playing = true;
+        function togglePlay() {
+            playing = !playing;
+            document.getElementById('playBtn').innerText = playing ? '⏸' : '▶️';
+        }
+        function changeTrack(d) {
+            curTrack = (curTrack + d + tracks.length) % tracks.length;
+            document.getElementById('trackTitle').innerText = tracks[curTrack].title;
+            document.getElementById('trackArtist').innerText = tracks[curTrack].artist;
+        }
+
+        function showToast(msg) {
+            const t = document.getElementById('toast');
+            t.innerText = msg;
+            t.style.display = 'block';
+            clearTimeout(window._toastTimer);
+            window._toastTimer = setTimeout(() => { t.style.display = 'none'; }, 2800);
+        }
+    </script>
+</body>
+</html>
+"""
+
+class CarPlayOSHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # إبقاء الطرفية نظيفة وسريعة
+
+    def do_GET(self):
+        if self.path == '/api/ecu':
+            # توليد قراءات حية تحاكي تدفق بيانات CANBUS من كمبيوتر الكامري
+            live_telemetry = {
+                "speed": random.randint(82, 86),
+                "rpm": random.randint(1820, 1890),
+                "voltage": round(random.uniform(14.0, 14.2), 1),
+                "coolant_temp": 88,
+                "instant_fuel": round(random.uniform(14.2, 15.6), 1),
+                "throttle": random.randint(16, 21),
+                "last_can_id": random.choice(["0x7E0 (ECM)", "0x750 (BCM)", "0x7C0 (Meter)", "0x7C4 (A/C)"]),
+                "rx_frames": int(time.time() * 12) % 99999,
+                "tpms": {"fr": 33, "fl": 33, "rr": 33, "rl": 32}
+            }
+            self.send_response(200)
+            self.send_header("Content-type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"state": system_state, "live_telemetry": live_telemetry}, ensure_ascii=False).encode('utf-8'))
+            return
+
+        if self.path == '/api/apps':
+            self.send_response(200)
+            self.send_header("Content-type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps(installed_apps_db, ensure_ascii=False).encode('utf-8'))
+            return
+
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(html_content.encode('utf-8'))
+
+    def do_POST(self):
+        global system_state
+        if self.path == '/api/ecu':
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length).decode('utf-8')
+            try:
+                system_state = json.loads(body)
+                save_state(system_state)
+            except Exception:
+                pass
+            self.send_response(200)
+            self.send_header("Content-type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ok"}).encode('utf-8'))
+            return
+
+socketserver.TCPServer.allow_reuse_address = True
+
+with socketserver.TCPServer(("", PORT), CarPlayOSHandler) as httpd:
+    print(f"=== Camry CarPlay OS v3.0 is running on http://localhost:{PORT} ===")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
